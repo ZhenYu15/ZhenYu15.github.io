@@ -1,0 +1,317 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>AI/ML Model Visualizer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html, body { margin:0; padding:0; height:100%; font-family: system-ui, Arial; }
+    #app { display:flex; height:100vh; }
+    .pane { border-right:1px solid #ddd; padding:12px; box-sizing:border-box; overflow:auto; }
+    .pane:last-child { border-right:none; }
+    #codePane { width:35%; display:flex; flex-direction:column; }
+    #runPane  { width:25%; }
+    #vizPane  { flex:1; }
+    textarea { width:100%; height:calc(100% - 70px); resize:none; font-family: ui-monospace, Menlo, Consolas; font-size:12px; }
+    button { padding:8px 12px; margin-right:6px; cursor:pointer; }
+    #dropzone { border:2px dashed #bbb; padding:18px; text-align:center; color:#666; margin-top:8px; }
+    #status { margin-top:8px; font-size:12px; color:#333; white-space:pre-wrap; }
+    /* node coloring */
+    .node.input  { fill:#c8f7c5; stroke:#000; stroke-width:1; }
+    .node.hidden { fill:#fff;    stroke:#000; stroke-width:1; }
+    .node.output { fill:#cfe8ff; stroke:#000; stroke-width:1; }
+    .link { stroke-opacity:0.35; }
+    .link.active { stroke-opacity:0.95; }
+    .layer-label { font-size:11px; fill:#333; }
+  </style>
+</head>
+<body>
+<div id="app">
+  <!-- Pane 1: Python code editor -->
+  <div id="codePane" class="pane">
+    <h3>1) Python Model Code (.pth + code both required)</h3>
+    <p>Provide <code>build_model()</code> and optional <code>build_example_input(model)</code>. PyTorch only.</p>
+    <textarea id="code"></textarea>
+    <div style="margin-top:8px">
+      <button id="saveCode">Save Code</button>
+    </div>
+    <div id="statusCode"></div>
+  </div>
+
+  <!-- Pane 2: Test Runner -->
+  <div id="runPane" class="pane">
+    <h3>2) Test Runner</h3>
+    <p>Drag & drop your <b>.pth</b> here, then click <b>Prepare</b> and <b>Play</b>.</p>
+    <div id="dropzone">Drop <b>.pth</b> file here</div>
+    <div style="margin-top:10px">
+      <button id="prepareBtn">Prepare</button>
+      <button id="playBtn" disabled>Play ▶</button>
+    </div>
+    <div id="status"></div>
+  </div>
+
+  <!-- Pane 3: Visualization -->
+  <div id="vizPane" class="pane">
+    <h3>3) Model Visualization (live)</h3>
+    <svg id="svg" width="100%" height="90%"></svg>
+    <div style="font-size:12px; color:#555; margin-top:6px;">
+      Legend: Red=positive weight, Blue=negative weight. Thicker = larger |weight|. Lighter lines/nodes = inactive; darker during activation.
+    </div>
+  </div>
+</div>
+
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<script>
+const API = "http://127.0.0.1:8000";
+const codeEl = document.getElementById("code");
+const saveCodeBtn = document.getElementById("saveCode");
+const statusCodeEl = document.getElementById("statusCode");
+
+const dropzone = document.getElementById("dropzone");
+const prepareBtn = document.getElementById("prepareBtn");
+const playBtn = document.getElementById("playBtn");
+const statusEl = document.getElementById("status");
+
+const svg = d3.select("#svg");
+const W = () => svg.node().clientWidth;
+const H = () => svg.node().clientHeight;
+
+let GRAPH = null;
+let ACTIV = {}; // layer_id -> [activations per node]
+
+/* ---------- Default sample code ---------- */
+codeEl.value = `# Your Model Going Here
+import torch
+import torch.nn as nn
+
+
+`;
+
+/* ---------- UI helpers ---------- */
+function logStatus(el, msg) {
+  el.textContent = (el.textContent ? el.textContent + "\\n" : "") + msg;
+  el.scrollTop = el.scrollHeight;
+}
+
+/* ---------- API calls ---------- */
+saveCodeBtn.onclick = async () => {
+  statusCodeEl.textContent = "";
+  const res = await fetch(API + "/api/set_code", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({code: codeEl.value})
+  });
+  const j = await res.json();
+  if (!j.ok) {
+    statusCodeEl.textContent = "❌ " + (j.error || "Failed to save code");
+  } else {
+    statusCodeEl.textContent = "✅ Model code accepted.";
+  }
+};
+
+dropzone.addEventListener("dragover", e => {
+  e.preventDefault();
+  dropzone.style.background = "#f5f5f5";
+});
+dropzone.addEventListener("dragleave", e => {
+  dropzone.style.background = "";
+});
+dropzone.addEventListener("drop", async e => {
+  e.preventDefault();
+  dropzone.style.background = "";
+  const file = e.dataTransfer.files[0];
+  if (!file) return;
+  if (!file.name.endsWith(".pth")) {
+    logStatus(statusEl, "❌ Only .pth supported.");
+    return;
+  }
+  const form = new FormData();
+  form.append("file", file);
+  const res = await fetch(API + "/api/upload_pth", { method:"POST", body: form });
+  const j = await res.json();
+  if (!j.ok) logStatus(statusEl, "❌ " + j.error);
+  else logStatus(statusEl, "✅ " + j.info);
+});
+
+prepareBtn.onclick = async () => {
+  const res = await fetch(API + "/api/prepare", { method:"POST" });
+  const j = await res.json();
+  if (!j.ok) {
+    logStatus(statusEl, "❌ " + j.error);
+    playBtn.disabled = true;
+    return;
+  }
+  GRAPH = j.graph;
+  logStatus(statusEl, "✅ Prepared. Graph nodes: " + GRAPH.nodes.length + ", edges: " + GRAPH.edges.length);
+  drawGraph(GRAPH);
+  playBtn.disabled = false;
+};
+
+playBtn.onclick = async () => {
+  if (!GRAPH) { logStatus(statusEl, "❌ Prepare first."); return; }
+  const url = "ws://127.0.0.1:8000/ws/run";
+  const ws = new WebSocket(url);
+
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === "tick") {
+      ACTIV = msg.activations || {};
+      updateActivations();
+    } else if (msg.type === "done") {
+      logStatus(statusEl, " Run complete. ");
+      ws.close();
+      // 🔄 Reset after 3 seconds
+      setTimeout(() => {
+        ACTIV = {};
+        updateActivations();
+        logStatus(statusEl, "(Visualization reset to inactive)");
+      }, 3000);
+    } else if (msg.type === "error") {
+      logStatus(statusEl, "❌ " + msg.error);
+      ws.close();
+      // 🔄 Also reset on error
+      setTimeout(() => {
+        ACTIV = {};
+        updateActivations();
+      }, 1000);
+    }
+  };
+
+  ws.onopen = () => logStatus(statusEl, " ▶ Running...");
+  ws.onerror = () => logStatus(statusEl, " ❌ WebSocket error.");
+};
+
+/* ---------- Visualization ---------- */
+let layout = null;
+let layerX = new Map();
+let layerNodeCounts = new Map();
+
+function drawGraph(graph) {
+  svg.selectAll("*").remove();
+
+  // Build a simple layered layout horizontally
+  const margin = {left: 80, right: 40, top: 40, bottom: 40};
+  const width = W() - margin.left - margin.right;
+  const height = H() - margin.top - margin.bottom;
+  const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
+
+  const layers = graph.nodes;
+  const L = layers.length;
+  const xStep = width / Math.max(1, L - 1);
+
+  layerX = new Map();
+  layerNodeCounts = new Map();
+  layers.forEach((layer, i) => {
+    layerX.set(layer.layer_id, i * xStep);
+    layerNodeCounts.set(layer.layer_id, layer.count);
+  });
+
+  // Node Y positions per layer (grid)
+  const maxNodesShown = d3.max(layers, d => d.count) || 1;
+  const yScale = d3.scaleLinear().domain([0, maxNodesShown-1]).range([0, height]);
+
+  // Precompute node positions (downsampled "slots")
+  const nodePositions = {}; // layer_id -> [{y, idx}]
+  layers.forEach(layer => {
+    const n = layer.count;
+    const pos = [];
+    const denom = Math.max(1, n - 1);
+    for (let i = 0; i < n; i++) {
+      const y = denom === 0 ? height/2 : yScale(i * (maxNodesShown-1)/(n-1));
+      pos.push({ y, idx: i });
+    }
+    nodePositions[layer.layer_id] = pos;
+  });
+
+  // Draw links
+  const links = graph.edges.map(e => {
+    const from = e.from_layer;
+    const to = e.to_layer;
+    const i = Math.min(e.i, nodePositions[from].length-1);
+    const j = Math.min(e.j, nodePositions[to].length-1);
+    return {
+      from, to, i, j, w: e.w,
+      x1: layerX.get(from), y1: nodePositions[from][i].y,
+      x2: layerX.get(to),   y2: nodePositions[to][j].y
+    };
+  });
+
+  const weightToWidth = d3.scaleLinear()
+    .domain([0, d3.quantile(links.map(d => Math.abs(d.w)).sort(d3.ascending), 0.95) || 1e-6])
+    .range([0.2, 4.0]); // keep thin to avoid clutter
+
+  const linkSel = g.append("g").attr("class","links").selectAll("line")
+    .data(links)
+    .join("line")
+    .attr("class", "link")
+    .attr("x1", d => d.x1).attr("y1", d => d.y1)
+    .attr("x2", d => d.x2).attr("y2", d => d.y2)
+    .attr("stroke", d => d.w >= 0 ? "red" : "blue")
+    .attr("stroke-width", d => weightToWidth(Math.abs(d.w)));
+
+  // Draw nodes
+  const nodeGroups = g.append("g").attr("class","nodes");
+  const nodeSel = [];
+  layers.forEach((layer, idx) => {
+    const type = layer.type;
+    const kind = idx === 0 ? "input" : (idx === layers.length-1 ? "output" : "hidden");
+
+    // Per-node circles
+    const nodes = nodeGroups.selectAll(`.node-${layer.layer_id}`)
+      .data(nodePositions[layer.layer_id])
+      .join("circle")
+      .attr("class", `node ${kind}`)
+      .attr("cx", layerX.get(layer.layer_id))
+      .attr("cy", d => d.y)
+      .attr("r", 4);
+
+    nodeSel.push({ layer_id: layer.layer_id, selection: nodes, kind });
+
+    // Layer labels
+    g.append("text")
+      .attr("class", "layer-label")
+      .attr("x", layerX.get(layer.layer_id))
+      .attr("y", -10)
+      .attr("text-anchor", "middle")
+      .text(`${layer.label} (${layer.count})`);
+  });
+
+  layout = { g, links: linkSel, nodes: nodeSel, layers, graph, weightToWidth };
+  updateActivations(); // initial
+}
+
+function updateActivations() {
+  if (!layout || !GRAPH) return;
+
+  // Node brightness by activation magnitude (normalize per layer)
+  layout.nodes.forEach(entry => {
+    const { layer_id, selection, kind } = entry;
+    const acts = (ACTIV && ACTIV[layer_id]) ? ACTIV[layer_id] : null;
+
+    let opacities = [];
+    if (acts && acts.length) {
+      const maxA = Math.max(1e-9, ...acts.map(Math.abs));
+      opacities = acts.map(a => 0.2 + 0.8 * (Math.abs(a) / maxA)); // [0.2..1.0]
+    }
+
+    selection.attr("fill-opacity", (d, i) => {
+      if (!opacities.length) return 0.25; // inactive
+      return opacities[Math.min(i, opacities.length - 1)];
+    });
+  });
+
+  // Edge activity: if source and target activations imply contribution far from 0
+  // For simplicity we darken edges where |w| * act_src is high.
+  if (layout.links) {
+    const activByLayer = ACTIV || {};
+    layout.links
+      .classed("active", d => {
+        const srcActs = activByLayer[d.from] || [];
+        const a = srcActs[Math.min(d.i, srcActs.length - 1)] || 0;
+        return Math.abs(a * d.w) > 1e-6;
+      });
+  }
+}
+</script>
+</body>
+</html>
