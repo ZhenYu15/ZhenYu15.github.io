@@ -226,7 +226,7 @@ playBtn.onclick = async () => {
     try{ runSocket.close(); }catch(e){}
     runSocket = null;
   }
-  const url = "wss://nnvisual-backend.onrender.com/ws/run";
+  const url = "wss://zhenyu15-github-io.onrender.com/ws/run";
   const ws = new WebSocket(url);
   runSocket = ws;
   document.querySelector("#vizPane").classList.add("running");
@@ -406,5 +406,6 @@ window.addEventListener("resize", ()=> {
 </script>
 </body>
 </html>
+
 
 
